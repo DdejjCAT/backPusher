@@ -2,11 +2,6 @@
 """
 backPusher for remnawave
 by @error_kill
-
-Использование:
-  python3 bypass.py
-  python3 bypass.py --undo
-  python3 bypass.py --status
 """
 
 import subprocess
@@ -38,6 +33,160 @@ def find_backend_container():
 
     print("❌ Контейнер remnawave/backend не найден")
     return None
+
+
+def get_db_credentials(backend_container, silent=False):
+    if not silent:
+        print("🔍 Получаем данные для подключения к БД...")
+    
+    env_output = run(f"docker inspect {backend_container} --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}'")
+    if not env_output:
+        if not silent:
+            print("  ❌ Не удалось получить переменные окружения")
+        return None
+    
+    db_url = None
+    for line in env_output.split("\n"):
+        if line.startswith("DATABASE_URL="):
+            db_url = line.split("=", 1)[1]
+            break
+            
+    if not db_url:
+        if not silent:
+            print("  ❌ DATABASE_URL не найден в переменных окружения")
+        return None
+    
+    if not silent:
+        print(f"  ✅ URL: {db_url}")
+    
+    match = re.match(r'postgres(?:ql)?://([^:]+):(.+)@([^:/]+):(\d+)/([^?]+)', db_url)
+    if not match:
+        match = re.match(r'postgres(?:ql)?://([^:]+):(.+)@([^:/]+)/([^?]+)', db_url)
+        
+    if not match:
+        if not silent:
+            print("  ❌ Не удалось распарсить DATABASE_URL")
+        return None
+        
+    user, password, host, port_or_db, extra = match.groups()
+    
+    if port_or_db.isdigit():
+        port = port_or_db
+        dbname = extra
+    else:
+        port = "5432"
+        dbname = port_or_db
+        
+    if not silent:
+        print(f"  ✅ Хост: {host}, Порт: {port}, БД: {dbname}, Пользователь: {user}")
+    return host, user, password, dbname
+
+
+def find_database_container(db_host, silent=False):
+    if not silent:
+        print(f"🔍 Ищем контейнер БД по хосту '{db_host}'...")
+    
+    output = run("docker ps --format '{{.Names}}'")
+    if not output:
+        if not silent:
+            print("  ❌ Не удалось получить список контейнеров")
+        return None
+    
+    for container in output.split("\n"):
+        if container.strip() == db_host:
+            if not silent:
+                print(f"  ✅ Найден: {container}")
+            return container
+    
+    for container in output.split("\n"):
+        if db_host in container:
+            if not silent:
+                print(f"  ✅ Найден (частичное совпадение): {container}")
+            return container
+    
+    if not silent:
+        print(f"  ❌ Контейнер с именем '{db_host}' не найден")
+        print(f"  📋 Доступные контейнеры: {output.replace(chr(10), ', ')}")
+    return None
+
+
+def get_first_admin(backend_container, silent=False):
+    if not silent:
+        print("🔍 Получаем данные первого администратора из БД...")
+    
+    db_creds = get_db_credentials(backend_container, silent=silent)
+    if not db_creds:
+        if not silent:
+            print("  ❌ Не удалось получить креды БД")
+        return None
+    
+    db_host, db_user, db_password, db_name = db_creds
+    
+    db_container = find_database_container(db_host, silent=silent)
+    if not db_container:
+        if not silent:
+            print("  ❌ Не удалось найти контейнер БД")
+        return None
+    
+    psql_check = run(f"docker exec {db_container} which psql", check=False)
+    if not psql_check:
+        if not silent:
+            print(f"  ⚠️  psql не найден в контейнере {db_container}")
+        return None
+    
+    if not silent:
+        print(f"  ✅ psql найден в {db_container}")
+    
+    safe_password = db_password.replace("'", "'\\''")
+    
+    query = "SELECT username FROM admin ORDER BY created_at ASC LIMIT 1;"
+    cmd = f"docker exec -e PGPASSWORD='{safe_password}' {db_container} psql -U {db_user} -d {db_name} -t -A -c \"{query}\""
+    
+    if not silent:
+        print(f"  📝 Выполняем запрос к БД...")
+    
+    result = run(cmd, check=False)
+    
+    if result and result.strip():
+        if not silent:
+            print(f"  ✅ Получен результат: {result.strip()}")
+        return result.strip()
+    
+    if not silent:
+        print(f"  ❌ Пустой результат от БД")
+        test_cmd = f"docker exec -e PGPASSWORD='{safe_password}' {db_container} psql -U {db_user} -d {db_name} -c \"SELECT 1;\" 2>&1"
+        test_result = run(test_cmd, check=False)
+        if test_result:
+            print(f"  🔍 Диагностический вывод: {test_result[:200]}")
+    
+    return None
+
+
+def show_first_admin():
+    print("=" * 60)
+    print("  Поиск первого администратора")
+    print("=" * 60)
+    print()
+
+    container = find_backend_container()
+    if not container:
+        sys.exit(1)
+
+    print()
+    username = get_first_admin(container, silent=False)
+    
+    if username:
+        print()
+        print("  ✅ Первый администратор найден!")
+        print(f"  👤 Логин (username): \033[1m{username}\033[0m")
+        print()
+        print("  💡 Так как хеш пароля нельзя расшифровать, используйте ЛЮБОЙ пароль для входа.")
+        print("     (При условии, что патч bypass.py уже применен!)")
+        print()
+    else:
+        print()
+        print("❌ Не удалось получить данные из базы данных.")
+        print("   Возможно, таблица 'admin' пуста или структура БД изменилась.")
 
 
 def find_auth_service(container):
@@ -92,7 +241,6 @@ def check_status(container, path):
 
 
 def apply_bypass(container, path):
-    """Отключает проверку пароля."""
     print("🔧 Отключаем проверку пароля...")
 
     content = get_file_content(container, path)
@@ -138,7 +286,6 @@ def undo_bypass(container, path):
 
 
 def restart_container(container):
-    """Перезапускает контейнер."""
     print(f"🔄 Перезапускаем {container}...")
     run(f"docker restart {container}")
     print("  ✅ Перезапущен")
@@ -152,11 +299,13 @@ def main():
   python3 bypass.py              # Отключить проверку пароля
   python3 bypass.py --undo       # Включить проверку пароля
   python3 bypass.py --status     # Проверить статус
+  python3 bypass.py --admin      # Показать первого администратора из БД
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--undo", action="store_true", help="Включить проверку пароля")
     parser.add_argument("--status", action="store_true", help="Проверить статус")
+    parser.add_argument("--admin", action="store_true", help="Показать первого администратора из БД")
 
     args = parser.parse_args()
 
@@ -164,6 +313,13 @@ def main():
     print("  Remnawave Bypass Universal")
     print("=" * 60)
     print()
+
+    if args.admin:
+        print("🔍 РЕЖИМ: ПОИСК АДМИНИСТРАТОРА")
+        print("-" * 60)
+        print()
+        show_first_admin()
+        return
 
     container = find_backend_container()
     if not container:
@@ -233,6 +389,18 @@ def main():
         print()
         print("📋 Проверка пароля отключена")
         print("📋 Войдите с ЛЮБЫМ паролем")
+        print()
+        
+        username = get_first_admin(container, silent=False)
+        
+        if username:
+            print()
+            print(f"  👤 Логин первого админа: \033[1m{username}\033[0m")
+            print("  💡 Используйте этот логин и ЛЮБОЙ пароль для входа!")
+        else:
+            print()
+            print("  ⚠️  Не удалось получить логин админа")
+            
         print()
         print("💡 Для отката: python3 bypass.py --undo")
     else:
